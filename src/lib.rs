@@ -17,6 +17,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub type StreamKey = String;
 pub type MessageId = String;
 
+pub type StreamReader = tokio::sync::mpsc::UnboundedReceiver<(MessageId, RedisMap)>;
+
 pub struct StreamRouter {
     buf: Sender<StreamHandle>,
     workers: Vec<Worker>,
@@ -44,11 +46,7 @@ impl StreamRouter {
         })
     }
 
-    pub fn observe(
-        &self,
-        stream_key: StreamKey,
-        last_id: Option<MessageId>,
-    ) -> UnboundedReceiver<(MessageId, RedisMap)> {
+    pub fn observe(&self, stream_key: StreamKey, last_id: Option<MessageId>) -> StreamReader {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let last_id = last_id.unwrap_or_else(|| "0-0".to_string());
         let h = StreamHandle::new(stream_key, last_id, tx);
@@ -136,10 +134,11 @@ impl Worker {
 
             for stream in result.keys {
                 let mut remove_sender = false;
-                if let Some(sender) = senders.get(stream.key.as_str()) {
+                if let Some((sender, idx)) = senders.get(stream.key.as_str()) {
                     for id in stream.ids {
                         let message_id = id.id;
                         let value = id.map;
+                        message_ids[*idx] = message_id.clone(); //TODO: optimize
                         if let Err(err) = sender.send((message_id, value)) {
                             tracing::warn!("failed to send: {}", err);
                             remove_sender = true;
@@ -161,13 +160,13 @@ impl Worker {
         tx: &Sender<StreamHandle>,
         keys: &mut Vec<StreamKey>,
         ids: &mut Vec<MessageId>,
-        senders: &mut HashMap<&'a str, StreamSender>,
+        senders: &mut HashMap<&'a str, (StreamSender, usize)>,
     ) {
         let mut keys = keys.drain(..);
         let mut ids = ids.drain(..);
         while let Some(key) = keys.next() {
             if let Some(last_id) = ids.next() {
-                if let Some(sender) = senders.remove(key.as_str()) {
+                if let Some((sender, _)) = senders.remove(key.as_str()) {
                     let h = StreamHandle::new(key, last_id, sender);
                     if let Err(err) = tx.send(h) {
                         tracing::warn!("failed to reschedule: {}", err);
@@ -183,7 +182,7 @@ impl Worker {
         rx: &Receiver<StreamHandle>,
         stream_keys: &mut Vec<StreamKey>,
         message_ids: &mut Vec<MessageId>,
-        senders: &mut HashMap<&'static str, StreamSender>,
+        senders: &mut HashMap<&'static str, (StreamSender, usize)>,
     ) -> bool {
         // try to receive first element - block thread if there's none
         let mut count = stream_keys.capacity();
@@ -191,7 +190,7 @@ impl Worker {
             // senders and stream_keys have bound lifetimes and fixed internal buffers
             // since API users are using StreamKeys => String, we want to avoid allocations
             let key_ref: &'static str = unsafe { std::mem::transmute(h.key.as_str()) };
-            senders.insert(key_ref, h.sender);
+            senders.insert(key_ref, (h.sender, stream_keys.len()));
             stream_keys.push(h.key);
             message_ids.push(h.last_id);
 
@@ -203,7 +202,7 @@ impl Worker {
             // try to fill more without blocking if there's anything on the receiver
             while let Ok(h) = rx.try_recv() {
                 let key_ref: &'static str = unsafe { std::mem::transmute(h.key.as_str()) };
-                senders.insert(key_ref, h.sender);
+                senders.insert(key_ref, (h.sender, stream_keys.len()));
                 stream_keys.push(h.key);
                 message_ids.push(h.last_id);
 
