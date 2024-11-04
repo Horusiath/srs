@@ -1,0 +1,15 @@
+[package]
+name = "srs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redis = { version = "0.27.5", features = ["tokio"] }
+tokio = { version = "1.41.0", features = ["rt"] }
+tokio-util = { version = "0.7.12" }
+futures = "0.3.31"
+loole = "0.4.0"
+tracing = { version = "0.1.40", features = ["log"] }
+
+[dev-dependencies]
+tokio = { version = "1.41.0", features = ["full"] }
