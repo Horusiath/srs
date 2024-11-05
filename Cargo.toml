@@ -13,3 +13,4 @@ tracing = { version = "0.1.40", features = ["log"] }
 
 [dev-dependencies]
 tokio = { version = "1.41.0", features = ["full"] }
+rand = "0.8.5"

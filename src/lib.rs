@@ -240,22 +240,16 @@ impl StreamHandle {
 #[cfg(test)]
 mod test {
     use crate::{MessageId, StreamRouter};
+    use rand::random;
     use redis::{Client, Commands, FromRedisValue};
     use tokio::task::JoinSet;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn workers() {
+    async fn multi_worker_preexisting_messages() {
         const ROUTES_COUNT: usize = 200;
         const MSG_PER_ROUTE: usize = 10;
         let mut client = Client::open("redis://127.0.0.1/").unwrap();
-        let mut keys = Vec::with_capacity(ROUTES_COUNT);
-        for i in 0..ROUTES_COUNT {
-            let key = format!("test:{}", i);
-            for i in 0..MSG_PER_ROUTE {
-                let _: MessageId = client.xadd(&key, "*", &[("data", i)]).unwrap();
-            }
-            keys.push(key);
-        }
+        let mut keys = init_streams(&mut client, ROUTES_COUNT, MSG_PER_ROUTE);
 
         let router = StreamRouter::new(&client).unwrap();
 
@@ -265,8 +259,8 @@ mod test {
             join_set.spawn(async move {
                 for i in 0..MSG_PER_ROUTE {
                     let (_msg_id, map) = observer.recv().await.unwrap();
-                    let value = usize::from_redis_value(&map["data"]).unwrap();
-                    assert_eq!(value, i);
+                    let value = String::from_redis_value(&map["data"]).unwrap();
+                    assert_eq!(value, format!("{}-{}", key, i));
                 }
             });
         }
@@ -274,5 +268,56 @@ mod test {
         while let Some(t) = join_set.join_next().await {
             t.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_worker_live_messages() {
+        const ROUTES_COUNT: usize = 200;
+        const MSG_PER_ROUTE: usize = 10;
+        let mut client = Client::open("redis://127.0.0.1/").unwrap();
+        let mut keys = init_streams(&mut client, ROUTES_COUNT, 0);
+
+        let router = StreamRouter::new(&client).unwrap();
+
+        let mut join_set = JoinSet::new();
+        for key in keys.iter().cloned() {
+            let mut observer = router.observe(key.clone(), None);
+            join_set.spawn(async move {
+                for i in 0..MSG_PER_ROUTE {
+                    let (_msg_id, map) = observer.recv().await.unwrap();
+                    let value = String::from_redis_value(&map["data"]).unwrap();
+                    assert_eq!(value, format!("{}-{}", key, i));
+                }
+            });
+        }
+
+        for msg_idx in 0..MSG_PER_ROUTE {
+            for key in keys.iter() {
+                let data = format!("{}-{}", key, msg_idx);
+                let _: MessageId = client.xadd(&key, "*", &[("data", data)]).unwrap();
+            }
+        }
+
+        while let Some(t) = join_set.join_next().await {
+            t.unwrap();
+        }
+    }
+
+    fn init_streams(
+        client: &mut Client,
+        stream_count: usize,
+        msgs_per_stream: usize,
+    ) -> Vec<String> {
+        let test_prefix: u32 = random();
+        let mut keys = Vec::with_capacity(stream_count);
+        for worker_idx in 0..stream_count {
+            let key = format!("test:{}:{}", test_prefix, worker_idx);
+            for msg_idx in 0..msgs_per_stream {
+                let data = format!("{}-{}", key, msg_idx);
+                let _: MessageId = client.xadd(&key, "*", &[("data", data)]).unwrap();
+            }
+            keys.push(key);
+        }
+        keys
     }
 }
