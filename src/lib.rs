@@ -7,19 +7,25 @@ use redis::RedisError;
 use redis::RedisResult;
 use redis::Value;
 use std::collections::HashMap;
-use std::error::Error;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
 
+/// Redis stream key.
 pub type StreamKey = String;
+
+/// Redis stream message identifier. It's default format `{unix_timestamp_millis}-{seq_nr}`
+/// is by default unique in scope of a [StreamKey].
 pub type MessageId = String;
 
+/// Channel returned by [StreamRouter::observe], that allows to receive messages retrieved by
+/// the router.
 pub type StreamReader = tokio::sync::mpsc::UnboundedReceiver<(MessageId, RedisMap)>;
 
+/// Redis stream router used to multiplex multiple number of Redis stream read requests over a
+/// fixed number of Redis connections.
 pub struct StreamRouter {
     buf: Sender<StreamHandle>,
     workers: Vec<Worker>,
@@ -35,11 +41,19 @@ impl StreamRouter {
         let alive = Arc::new(AtomicBool::new(true));
         let (tx, rx) = loole::unbounded();
         let mut workers = Vec::with_capacity(options.worker_count);
-        for _ in 0..options.worker_count {
+        for worker_id in 0..options.worker_count {
             let conn = client.get_connection()?;
-            let worker = Worker::new(conn, tx.clone(), rx.clone(), alive.clone(), &options);
+            let worker = Worker::new(
+                worker_id,
+                conn,
+                tx.clone(),
+                rx.clone(),
+                alive.clone(),
+                &options,
+            );
             workers.push(worker);
         }
+        tracing::info!("stared Redis stream router with {} workers", workers.len());
         Ok(Self {
             buf: tx,
             workers,
@@ -62,11 +76,25 @@ impl Drop for StreamRouter {
     }
 }
 
+/// Options used to configure [StreamRouter].
 #[derive(Debug, Clone)]
 pub struct StreamRouterOptions {
+    /// Number of worker threads. Each worker thread has its own Redis connection.
+    /// Default: number of CPU threads but can vary under specific circumstances.
     pub worker_count: usize,
+    /// How many Redis streams a single Redis poll worker can read at a time.
+    /// Default: 100
     pub xread_streams: usize,
+    /// How long poll worker will be blocked while waiting for Redis `XREAD` request to respond.
+    /// This blocks a worker thread and doesn't affect other threads.
+    ///
+    /// If set to `None` it won't block and will return immediately, which gives a biggest
+    /// responsiveness but can lead to unnecessary active loops causing CPU spikes even when idle.
+    ///
+    /// Default: `Some(0)` meaning blocking for indefinite amount of time.
     pub xread_block_millis: Option<usize>,
+    /// How many messages a single worker's `XREAD` request is allowed to return.
+    /// Default: `None` (unbounded).
     pub xread_count: Option<usize>,
 }
 
@@ -87,6 +115,7 @@ struct Worker {
 
 impl Worker {
     fn new(
+        worker_id: usize,
         conn: Connection,
         tx: Sender<StreamHandle>,
         rx: Receiver<StreamHandle>,
@@ -103,7 +132,7 @@ impl Worker {
         let count = options.xread_streams;
         let handle = std::thread::spawn(move || {
             if let Err(err) = Self::process_streams(conn, tx, rx, alive, xread_options, count) {
-                tracing::error!("worker failed: {}", err);
+                tracing::error!("worker {} failed: {}", worker_id, err);
             }
         });
         Self { handle }
