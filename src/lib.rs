@@ -7,6 +7,7 @@ use redis::RedisError;
 use redis::RedisResult;
 use redis::Value;
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
@@ -301,6 +302,22 @@ mod test {
         while let Some(t) = join_set.join_next().await {
             t.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn stream_reader_continue_from() {
+        let mut client = Client::open("redis://127.0.0.1/").unwrap();
+        let key = format!("test:{}:{}", random::<u32>(), 0);
+        let _: MessageId = client.xadd(&key, "*", &[("data", 1)]).unwrap();
+        let m2: MessageId = client.xadd(&key, "*", &[("data", 2)]).unwrap();
+        let m3: MessageId = client.xadd(&key, "*", &[("data", 3)]).unwrap();
+
+        let router = StreamRouter::new(&client).unwrap();
+        let mut observer = router.observe(key, Some(m2));
+
+        let (msg_id, m) = observer.recv().await.unwrap();
+        assert_eq!(msg_id, m3);
+        assert_eq!(u32::from_redis_value(&m["data"]).unwrap(), 3);
     }
 
     fn init_streams(
